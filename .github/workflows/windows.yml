@@ -13,41 +13,51 @@ on:
       - 'docs/**'
   workflow_dispatch:
 
-# ---------------------------------------------------------------------------
-# Toolchain pins - single source of truth (bumped to newest, 2026-09).
+# ===========================================================================
+# 工具链版本（唯一真源）—— 2026-09 全部取最新
 #
-#   CUDA 12.9.2 : NOTE - CUDA 12.10 does not exist. The 12.x line stopped at
-#                 12.9.2 (May 2026), so this is the newest 12.x toolkit.
-#                 Newest overall is 13.4.2; to go there change CUDA_VERSION /
-#                 CUDA_ROOT (v13.4) / CUDA_INSTALLER, AND use the
-#                 windows-2025-vs2026 image with the VS 18 vcvars64.bat path,
-#                 because nvcc 12.9 rejects the VS 2026 (MSVC 19.5x) compiler.
-#   Python 3.14 : installed and owned by uv (astral-sh/setup-uv), replacing the
-#                 hand-rolled python-3.12.8 embeddable download.
-#   Runner      : windows-2025 (Server 2025 + VS 2022 v17.14); windows-latest
-#                 currently resolves to this same image.
-#   vcpkg       : cloned from main at build time - the "Cache vcpkg tool" key
-#                 below is the knob that decides when a fresh (latest) clone
-#                 happens, so bump it to pull a new vcpkg revision.
-#   Actions     : checkout v7, cache v6, setup-uv v10.2.0 = newest majors.
-# ---------------------------------------------------------------------------
+#  默认 = 最新栈（已核实的字面量）：
+#     CUDA 13.4.2  : 最新版（12.10 不存在；12.x 止于 12.9.2）。
+#                    Windows 安装器名 cuda_13.4.2_windows_x86_64.exe（已从下载页核实）。
+#     VS 2026 18.x : CUDA 13.4 编译器支持表把 "MSVC 195x / VS 2026 18.x" 列为 YES。
+#                    镜像 windows-2025-vs2026，VS 装在 \18\Enterprise。
+#     Python 3.14  : 由 uv 安装并持有。
+#     actions      : checkout v7 / cache v6 / setup-uv v10.2.0 / upload-artifact v7。
+#
+#  ⚠ 若 configure 阶段（CUDA 编译器识别）就失败，整段 env 换成下面这段兼容栈，
+#     并把 build-windows 的 runs-on 改成 windows-2022 —— 这是唯一被原工作流
+#     验证过的组合，用来把"CUDA 13 大版本破坏"和"我的改动"分离定位：
+#
+#     CUDA_VERSION: "12.9.2"
+#     CUDA_ROOT: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+#     CUDA_INSTALLER: "https://developer.download.nvidia.com/compute/cuda/12.9.2/local_installers/cuda_12.9.2_576.57_windows.exe"
+#     CUDA_PATH_ENV_NAME: "CUDA_PATH_V12_9"
+#     VCVARS: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
+# ===========================================================================
 env:
-  CUDA_VERSION: "12.9.2"
-  CUDA_ROOT: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
-  CUDA_INSTALLER: "https://developer.download.nvidia.com/compute/cuda/12.9.2/local_installers/cuda_12.9.2_576.57_windows.exe"
+  CUDA_VERSION: "13.4.2"
+  CUDA_ROOT: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
+  CUDA_INSTALLER: "https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_x86_64.exe"
+  # nvcc 12.9 不认 VS2026 的 MSVC 195x；若需钉回老工具集（VS2026 镜像里并排装了 14.44），
+  # 把下面设成 '-vcvars_ver=14.44'。走 CUDA 13.4 时留空即用默认工具集。
+  VCVARS_ARGS: ''
+  CUDA_PATH_ENV_NAME: "CUDA_PATH_V13_4"
   PYTHON_VERSION: "3.14"
-  VCVARS: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
+  VCVARS: 'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
 
 jobs:
   windows-preflight:
     uses: ./.github/workflows/windows-build-preflight.yml
 
+  # -------------------------------------------------------------------------
+  # 该 job 不碰 C++/CUDA，留在通用最新 Windows 镜像即可。
+  # -------------------------------------------------------------------------
   test-plugin-venv:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v7
 
-      # uv installs and owns Python 3.14 - no more python-3.12.8-embed-amd64.zip
+      # uv 负责安装并持有 Python 3.14（原先是手写的 python-3.12.8-embed-amd64.zip）
       - name: Install uv and Python 3.14
         uses: astral-sh/setup-uv@v10.2.0
         with:
@@ -58,27 +68,25 @@ jobs:
         run: |
           uv --version
           uv python install $env:PYTHON_VERSION
-          # resolve from a neutral cwd so a project .venv can never win
+          # 在临时目录解析，避免仓库内 .venv 抢答
           Push-Location $env:TEMP
           $PYTHON = (uv python find $env:PYTHON_VERSION | Select-Object -Last 1).Trim()
           Pop-Location
-          if (-not (Test-Path $PYTHON)) {
-            Write-Error "FAIL: uv did not provide a Python $env:PYTHON_VERSION interpreter"
+          if (-not $PYTHON -or -not (Test-Path $PYTHON)) {
+            Write-Error "FAIL: uv 未能提供 Python $env:PYTHON_VERSION 解释器"
             exit 1
           }
           "UV_TEST_PYTHON=$PYTHON" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & $PYTHON --version
 
-      # NOTE: this job used to exercise the python-3.12.8 embeddable
-      # distribution. It now exercises a uv-managed CPython 3.14, so the
-      # "python3xx._pth / no full stdlib layout" edge case is no longer covered
-      # here - add an explicit embeddable step back if you still ship one.
+      # 注意：这里原先覆盖的是 python-3.12.8 embeddable 发行版，现在跑的是 uv 托管的
+      # 完整 CPython 3.14，python3xx._pth / 精简 stdlib 那个边界不再被覆盖。
+      # 如果产品仍内置 embeddable 发行版，请另加一个独立步骤把它按 3.14 下回来测。
       - name: Test uv sync with uv-managed Python 3.14
         shell: pwsh
         run: |
           $PYTHON = $env:UV_TEST_PYTHON
 
-          # Create minimal test plugin
           $PLUGIN = "$env:TEMP\test_plugin"
           New-Item -ItemType Directory -Force -Path $PLUGIN
           @"
@@ -89,7 +97,7 @@ jobs:
           dependencies = []
           "@ | Set-Content "$PLUGIN\pyproject.toml"
 
-          # Test 1: uv sync creates venv
+          # Test 1: uv sync 建出 venv
           uv sync --project $PLUGIN --python $PYTHON
           if (-not (Test-Path "$PLUGIN\.venv\Scripts\python.exe")) {
             Write-Error "FAIL: venv python not created"
@@ -97,7 +105,7 @@ jobs:
           }
           Write-Host "PASS: uv sync created venv with python.exe"
 
-          # Test 1b: the venv really is the uv-managed 3.14 interpreter
+          # Test 1b: venv 确实是 3.14
           $VERSION = & "$PLUGIN\.venv\Scripts\python.exe" -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"
           if ($VERSION.Trim() -ne "3.14") {
             Write-Error "FAIL: venv reports Python $VERSION, expected 3.14"
@@ -105,7 +113,7 @@ jobs:
           }
           Write-Host "PASS: venv runs Python $VERSION"
 
-          # Test 2: broken venv recovery
+          # Test 2: 破损 venv 自愈
           Remove-Item "$PLUGIN\.venv\Scripts\python.exe"
           uv sync --project $PLUGIN --python $PYTHON
           if (-not (Test-Path "$PLUGIN\.venv\Scripts\python.exe")) {
@@ -114,7 +122,7 @@ jobs:
           }
           Write-Host "PASS: uv sync recovered broken venv"
 
-          # Test 3: uv sync works when PYTHONHOME is set (simulates in-app environment)
+          # Test 3: PYTHONHOME 已设置（模拟 in-app 环境）
           Remove-Item -Recurse -Force "$PLUGIN\.venv"
           $env:PYTHONHOME = (& $PYTHON -c "import sys; print(sys.prefix)" | Select-Object -Last 1).Trim()
           uv sync --project $PLUGIN --python $PYTHON
@@ -125,7 +133,7 @@ jobs:
           }
           Write-Host "PASS: uv sync works with PYTHONHOME set"
 
-          # Test 4: uv sync works when PYTHONHOME points to wrong location
+          # Test 4: PYTHONHOME 指向错误位置
           Remove-Item -Recurse -Force "$PLUGIN\.venv"
           $env:PYTHONHOME = "C:\nonexistent\path"
           uv sync --project $PLUGIN --python $PYTHON
@@ -138,7 +146,8 @@ jobs:
 
   build-windows:
     needs: windows-preflight
-    runs-on: windows-2025
+    # 显式写 vs2026 标签，不要用 windows-2025（该标签当前也指向 VS2026 镜像，但会漂）
+    runs-on: windows-2025-vs2026
     strategy:
       fail-fast: false
       matrix:
@@ -146,7 +155,7 @@ jobs:
     env:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
       VCPKG_BUILD_TYPE: release
-      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
       BUILD_DIR: b
 
     steps:
@@ -168,8 +177,24 @@ jobs:
           Push-Location $env:TEMP
           $PYTHON = (uv python find $env:PYTHON_VERSION | Select-Object -Last 1).Trim()
           Pop-Location
+          if (-not $PYTHON -or -not (Test-Path $PYTHON)) {
+            Write-Error "FAIL: uv 未能提供 Python $env:PYTHON_VERSION 解释器"
+            exit 1
+          }
           "UV_PYTHON=$PYTHON" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & $PYTHON --version
+
+      - name: Verify toolchain paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path $env:VCVARS)) {
+            throw "vcvars64.bat not found at '$env:VCVARS' - wrong runner image for this VS version?"
+          }
+          if (Test-Path $env:CUDA_ROOT) {
+            Write-Host "CUDA already present at $env:CUDA_ROOT"
+          }
+          Write-Host "VCVARS OK: $env:VCVARS"
 
       - name: Install CUDA ${{ env.CUDA_VERSION }}
         run: |
@@ -180,7 +205,7 @@ jobs:
       - name: Set CUDA environment
         run: |
           echo "CUDA_PATH=$env:CUDA_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "CUDA_PATH_V12_9=$env:CUDA_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "$env:CUDA_PATH_ENV_NAME=$env:CUDA_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "$env:CUDA_ROOT\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "$env:CUDA_ROOT\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
@@ -195,11 +220,19 @@ jobs:
           key: vcpkg-tool-${{ runner.os }}-2026-09-27
           restore-keys: vcpkg-tool-${{ runner.os }}-
 
+      # 必须幂等：新 key 未命中时 restore-keys 会前缀命中旧缓存把目录恢复出来，
+      # 此时 cache-hit 仍是 false，直接 git clone 会因目录非空而失败。
       - name: Setup vcpkg
         if: steps.cache-vcpkg-tool.outputs.cache-hit != 'true'
         run: |
+          $ErrorActionPreference = 'Stop'
           cd ..
-          git clone https://github.com/microsoft/vcpkg.git
+          if (Test-Path vcpkg) {
+            git -C vcpkg fetch --all --prune
+            git -C vcpkg reset --hard origin/master
+          } else {
+            git clone https://github.com/microsoft/vcpkg.git
+          }
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
       - name: Cache vcpkg_installed
@@ -212,7 +245,8 @@ jobs:
       - name: Configure
         shell: cmd
         run: |
-          call "%VCVARS%"
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
+          where cl.exe
           cmake -B %BUILD_DIR% -S . -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLFS_FAST_COMPILE=ON -DBUILD_FORMAT_TESTS=ON -DBUILD_VISUALIZER_TESTS=ON -DBUILD_UNICODE_TEST_ONLY=ON -DBUILD_PYTHON_STUBS=OFF -DLFS_DEV_IMPORT_SOURCE_PYTHON=OFF -DLFS_DEV_IMPORT_SOURCE_RESOURCES=OFF -DLFS_ENABLE_CUDA_DEVICE_DEBUG=OFF
 
       - name: Generate shader headers for preflight
@@ -220,7 +254,7 @@ jobs:
         env:
           VCPKG_RUNTIME_SUBDIR: ${{ matrix.build_type == 'Debug' && 'debug\bin' || 'bin' }}
         run: |
-          call "%VCVARS%"
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
           set PATH=%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\%VCPKG_RUNTIME_SUBDIR%;%PATH%
           cmake --build %BUILD_DIR% --target lfs_shader_headers --config ${{ matrix.build_type }} -j 4
 
@@ -229,27 +263,27 @@ jobs:
         env:
           LFS_PREFLIGHT_BASE: ${{ github.event_name == 'pull_request' && 'HEAD^1' || github.event.before }}
         run: |
-          call "%VCVARS%"
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
           "%UV_PYTHON%" tools\windows_build_preflight.py --skip-source-checks --compile-commands %BUILD_DIR%\compile_commands.json --max-commands 512
 
       - name: Build
         shell: cmd
         run: |
-          call "%VCVARS%"
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
           set PATH=%CD%\%BUILD_DIR%;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%PATH%
           cmake --build %BUILD_DIR% -j %NUMBER_OF_PROCESSORS%
 
       - name: Build and run CPU-only format tests
         shell: cmd
         run: |
-          call "%VCVARS%"
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
           cmake --build %BUILD_DIR% --target lichtfeld_format_tests -j %NUMBER_OF_PROCESSORS%
           ctest --test-dir %BUILD_DIR% --output-on-failure -R "^lichtfeld_format_tests$"
 
       - name: Build and run CPU-only Unicode path tests
         shell: cmd
         run: |
-          call "%VCVARS%"
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
           cmake --build %BUILD_DIR% --target unicode_path_test -j %NUMBER_OF_PROCESSORS%
           %BUILD_DIR%\tests\unicode_path_test.exe --gtest_color=no
 
@@ -258,7 +292,7 @@ jobs:
         env:
           VCPKG_RUNTIME_SUBDIR: ${{ matrix.build_type == 'Debug' && 'debug\bin' || 'bin' }}
         run: |
-          call "%VCVARS%"
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
           set PATH=%CD%\%BUILD_DIR%;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\%VCPKG_RUNTIME_SUBDIR%;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\tools\python3;%CUDA_PATH%\bin;%PATH%
           cmake --build %BUILD_DIR% --target lichtfeld_visualizer_tests -j %NUMBER_OF_PROCESSORS%
           ctest --test-dir %BUILD_DIR% --output-on-failure -R "^lichtfeld_visualizer_tests$"
@@ -279,40 +313,63 @@ jobs:
           Write-Host "Found nvJPEG2000 runtime: $runtime"
           $extensions | ForEach-Object { Write-Host "Found nvjpeg2k extension: $($_.FullName)" }
 
+      # ---------------------------------------------------------------------
+      # 产物。Release 才分发（Debug 的 exe 依赖 vcpkg 的 debug DLL，拷出去跑不起来）；
+      # Debug 只上传 PDB 供符号化。
+      # ---------------------------------------------------------------------
+      - name: Probe build outputs
+        if: matrix.build_type == 'Release'
+        shell: cmd
+        run: |
+          call "%VCVARS%" %VCVARS_ARGS% || exit /b 1
+          echo ---- top level ----
+          dir /b %BUILD_DIR%
+          echo ---- exe/dll ----
+          dir /b %BUILD_DIR%\*.exe %BUILD_DIR%\*.dll
+
       - name: Stage distributable
         if: matrix.build_type == 'Release'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:BUILD_DIR 'dist'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          # 主程序 + 随构建产出的 DLL（含 nvjpeg2k_0.dll）
           Copy-Item (Join-Path $env:BUILD_DIR '*.exe') $stage -Force
           Copy-Item (Join-Path $env:BUILD_DIR '*.dll') $stage -Force
           if (Test-Path (Join-Path $env:BUILD_DIR 'extensions')) {
             Copy-Item (Join-Path $env:BUILD_DIR 'extensions') $stage -Recurse -Force
           }
 
-          # vcpkg 运行时依赖
           $vcpkgBin = Join-Path $env:BUILD_DIR 'vcpkg_installed\x64-windows\bin'
           if (Test-Path $vcpkgBin) { Copy-Item "$vcpkgBin\*.dll" $stage -Force }
 
-          # CUDA 运行时（构建目录没带出来的）
-          foreach ($pat in 'cudart64_*.dll','nvrtc64_*.dll','cublas64_*.dll','cublasLt64_*.dll','nvjpeg64_*.dll') {
-            Get-ChildItem (Join-Path $env:CUDA_PATH 'bin') -Filter $pat -ErrorAction SilentlyContinue |
-              Copy-Item -Destination $stage -Force
+          # CUDA 运行时（构建目录不会带出来）
+          $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+          foreach ($pat in 'cudart64_*.dll','nvrtc64_*.dll','cublas64_*.dll','cublasLt64_*.dll','nvjpeg64_*.dll','nvjpeg2k_*.dll') {
+            Get-ChildItem $cudaBin -Filter $pat -ErrorAction SilentlyContinue | Copy-Item -Destination $stage -Force
           }
 
           Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize
-          
-      - name: Upload build artifacts
+
+      - name: Upload release artifact
+        if: matrix.build_type == 'Release'
         uses: actions/upload-artifact@v7
         with:
-          # 必须区分 matrix 的两条腿，否则并发上传会撞名
+          # 必须带 build_type，否则两条腿并发上传同名会直接失败（overwrite 默认 false）
           name: lichtfeld-windows-${{ matrix.build_type }}
           path: |
             ${{ env.BUILD_DIR }}/dist/**
             ${{ env.BUILD_DIR }}/*.pdb
           if-no-files-found: error
           retention-days: 14
-          compression-level: 0   # DLL 本身已压缩，0 = 只打包不压缩，上传快很多
+          compression-level: 0
+
+      - name: Upload debug symbols
+        if: matrix.build_type == 'Debug'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichtfeld-windows-${{ matrix.build_type }}-symbols
+          path: ${{ env.BUILD_DIR }}/*.pdb
+          if-no-files-found: warn
+          retention-days: 7
