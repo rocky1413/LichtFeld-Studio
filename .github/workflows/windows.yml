@@ -278,3 +278,41 @@ jobs:
           }
           Write-Host "Found nvJPEG2000 runtime: $runtime"
           $extensions | ForEach-Object { Write-Host "Found nvjpeg2k extension: $($_.FullName)" }
+
+      - name: Stage distributable
+        if: matrix.build_type == 'Release'
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:BUILD_DIR 'dist'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # 主程序 + 随构建产出的 DLL（含 nvjpeg2k_0.dll）
+          Copy-Item (Join-Path $env:BUILD_DIR '*.exe') $stage -Force
+          Copy-Item (Join-Path $env:BUILD_DIR '*.dll') $stage -Force
+          if (Test-Path (Join-Path $env:BUILD_DIR 'extensions')) {
+            Copy-Item (Join-Path $env:BUILD_DIR 'extensions') $stage -Recurse -Force
+          }
+
+          # vcpkg 运行时依赖
+          $vcpkgBin = Join-Path $env:BUILD_DIR 'vcpkg_installed\x64-windows\bin'
+          if (Test-Path $vcpkgBin) { Copy-Item "$vcpkgBin\*.dll" $stage -Force }
+
+          # CUDA 运行时（构建目录没带出来的）
+          foreach ($pat in 'cudart64_*.dll','nvrtc64_*.dll','cublas64_*.dll','cublasLt64_*.dll','nvjpeg64_*.dll') {
+            Get-ChildItem (Join-Path $env:CUDA_PATH 'bin') -Filter $pat -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $stage -Force
+          }
+
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize
+          
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          # 必须区分 matrix 的两条腿，否则并发上传会撞名
+          name: lichtfeld-windows-${{ matrix.build_type }}
+          path: |
+            ${{ env.BUILD_DIR }}/dist/**
+            ${{ env.BUILD_DIR }}/*.pdb
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0   # DLL 本身已压缩，0 = 只打包不压缩，上传快很多
