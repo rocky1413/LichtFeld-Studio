@@ -13,28 +13,70 @@ on:
       - 'docs/**'
   workflow_dispatch:
 
+# ---------------------------------------------------------------------------
+# Toolchain pins - single source of truth (bumped to newest, 2026-09).
+#
+#   CUDA 12.9.2 : NOTE - CUDA 12.10 does not exist. The 12.x line stopped at
+#                 12.9.2 (May 2026), so this is the newest 12.x toolkit.
+#                 Newest overall is 13.4.2; to go there change CUDA_VERSION /
+#                 CUDA_ROOT (v13.4) / CUDA_INSTALLER, AND use the
+#                 windows-2025-vs2026 image with the VS 18 vcvars64.bat path,
+#                 because nvcc 12.9 rejects the VS 2026 (MSVC 19.5x) compiler.
+#   Python 3.14 : installed and owned by uv (astral-sh/setup-uv), replacing the
+#                 hand-rolled python-3.12.8 embeddable download.
+#   Runner      : windows-2025 (Server 2025 + VS 2022 v17.14); windows-latest
+#                 currently resolves to this same image.
+#   vcpkg       : cloned from main at build time - the "Cache vcpkg tool" key
+#                 below is the knob that decides when a fresh (latest) clone
+#                 happens, so bump it to pull a new vcpkg revision.
+#   Actions     : checkout v7, cache v6, setup-uv v10.2.0 = newest majors.
+# ---------------------------------------------------------------------------
+env:
+  CUDA_VERSION: "12.9.2"
+  CUDA_ROOT: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+  CUDA_INSTALLER: "https://developer.download.nvidia.com/compute/cuda/12.9.2/local_installers/cuda_12.9.2_576.57_windows.exe"
+  PYTHON_VERSION: "3.14"
+  VCVARS: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
+
 jobs:
   windows-preflight:
     uses: ./.github/workflows/windows-build-preflight.yml
 
   test-plugin-venv:
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install uv
+      # uv installs and owns Python 3.14 - no more python-3.12.8-embed-amd64.zip
+      - name: Install uv and Python 3.14
         uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
 
-      - name: Download Python embeddable
+      - name: Resolve the uv-managed Python
         shell: pwsh
         run: |
-          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip" -OutFile python-embed.zip
-          Expand-Archive python-embed.zip -DestinationPath python-embed
+          uv --version
+          uv python install $env:PYTHON_VERSION
+          # resolve from a neutral cwd so a project .venv can never win
+          Push-Location $env:TEMP
+          $PYTHON = (uv python find $env:PYTHON_VERSION | Select-Object -Last 1).Trim()
+          Pop-Location
+          if (-not (Test-Path $PYTHON)) {
+            Write-Error "FAIL: uv did not provide a Python $env:PYTHON_VERSION interpreter"
+            exit 1
+          }
+          "UV_TEST_PYTHON=$PYTHON" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $PYTHON --version
 
-      - name: Test uv sync with embedded Python
+      # NOTE: this job used to exercise the python-3.12.8 embeddable
+      # distribution. It now exercises a uv-managed CPython 3.14, so the
+      # "python3xx._pth / no full stdlib layout" edge case is no longer covered
+      # here - add an explicit embeddable step back if you still ship one.
+      - name: Test uv sync with uv-managed Python 3.14
         shell: pwsh
         run: |
-          $PYTHON = "$PWD\python-embed\python.exe"
+          $PYTHON = $env:UV_TEST_PYTHON
 
           # Create minimal test plugin
           $PLUGIN = "$env:TEMP\test_plugin"
@@ -43,7 +85,7 @@ jobs:
           [project]
           name = "test-plugin"
           version = "0.1.0"
-          requires-python = ">=3.12"
+          requires-python = ">=3.14"
           dependencies = []
           "@ | Set-Content "$PLUGIN\pyproject.toml"
 
@@ -54,6 +96,14 @@ jobs:
             exit 1
           }
           Write-Host "PASS: uv sync created venv with python.exe"
+
+          # Test 1b: the venv really is the uv-managed 3.14 interpreter
+          $VERSION = & "$PLUGIN\.venv\Scripts\python.exe" -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"
+          if ($VERSION.Trim() -ne "3.14") {
+            Write-Error "FAIL: venv reports Python $VERSION, expected 3.14"
+            exit 1
+          }
+          Write-Host "PASS: venv runs Python $VERSION"
 
           # Test 2: broken venv recovery
           Remove-Item "$PLUGIN\.venv\Scripts\python.exe"
@@ -66,7 +116,7 @@ jobs:
 
           # Test 3: uv sync works when PYTHONHOME is set (simulates in-app environment)
           Remove-Item -Recurse -Force "$PLUGIN\.venv"
-          $env:PYTHONHOME = "$PWD\python-embed"
+          $env:PYTHONHOME = (& $PYTHON -c "import sys; print(sys.prefix)" | Select-Object -Last 1).Trim()
           uv sync --project $PLUGIN --python $PYTHON
           $env:PYTHONHOME = $null
           if (-not (Test-Path "$PLUGIN\.venv\Scripts\python.exe")) {
@@ -88,7 +138,7 @@ jobs:
 
   build-windows:
     needs: windows-preflight
-    runs-on: windows-2022
+    runs-on: windows-2025
     strategy:
       fail-fast: false
       matrix:
@@ -96,7 +146,7 @@ jobs:
     env:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
       VCPKG_BUILD_TYPE: release
-      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
       BUILD_DIR: b
 
     steps:
@@ -106,18 +156,33 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Install CUDA 12.8
+      - name: Install uv and Python 3.14
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Resolve the uv-managed Python
+        shell: pwsh
+        run: |
+          uv python install $env:PYTHON_VERSION
+          Push-Location $env:TEMP
+          $PYTHON = (uv python find $env:PYTHON_VERSION | Select-Object -Last 1).Trim()
+          Pop-Location
+          "UV_PYTHON=$PYTHON" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $PYTHON --version
+
+      - name: Install CUDA ${{ env.CUDA_VERSION }}
         run: |
           cd ..
-          Invoke-WebRequest https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe -OutFile cuda.exe -Verbose
+          Invoke-WebRequest $env:CUDA_INSTALLER -OutFile cuda.exe -Verbose
           Start-Process -FilePath .\cuda.exe -ArgumentList "-y -s -accepteula -toolkit -override -noDisplayDriver" -Wait
 
       - name: Set CUDA environment
         run: |
-          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "CUDA_PATH=$env:CUDA_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_PATH_V12_9=$env:CUDA_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "$env:CUDA_ROOT\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "$env:CUDA_ROOT\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Normalize vcpkg path
         run: '"VCPKG_ROOT=$([System.IO.Path]::GetFullPath($env:VCPKG_ROOT))" >> $env:GITHUB_ENV'
@@ -127,7 +192,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ env.VCPKG_ROOT }}
-          key: vcpkg-tool-${{ runner.os }}-2026-02-21
+          key: vcpkg-tool-${{ runner.os }}-2026-09-27
           restore-keys: vcpkg-tool-${{ runner.os }}-
 
       - name: Setup vcpkg
@@ -141,13 +206,13 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ env.BUILD_DIR }}/vcpkg_installed
-          key: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
-          restore-keys: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-
+          key: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v2-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v2-
 
       - name: Configure
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           cmake -B %BUILD_DIR% -S . -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLFS_FAST_COMPILE=ON -DBUILD_FORMAT_TESTS=ON -DBUILD_VISUALIZER_TESTS=ON -DBUILD_UNICODE_TEST_ONLY=ON -DBUILD_PYTHON_STUBS=OFF -DLFS_DEV_IMPORT_SOURCE_PYTHON=OFF -DLFS_DEV_IMPORT_SOURCE_RESOURCES=OFF -DLFS_ENABLE_CUDA_DEVICE_DEBUG=OFF
 
       - name: Generate shader headers for preflight
@@ -155,7 +220,7 @@ jobs:
         env:
           VCPKG_RUNTIME_SUBDIR: ${{ matrix.build_type == 'Debug' && 'debug\bin' || 'bin' }}
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           set PATH=%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\%VCPKG_RUNTIME_SUBDIR%;%PATH%
           cmake --build %BUILD_DIR% --target lfs_shader_headers --config ${{ matrix.build_type }} -j 4
 
@@ -164,27 +229,27 @@ jobs:
         env:
           LFS_PREFLIGHT_BASE: ${{ github.event_name == 'pull_request' && 'HEAD^1' || github.event.before }}
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          python tools\windows_build_preflight.py --skip-source-checks --compile-commands %BUILD_DIR%\compile_commands.json --max-commands 512
+          call "%VCVARS%"
+          "%UV_PYTHON%" tools\windows_build_preflight.py --skip-source-checks --compile-commands %BUILD_DIR%\compile_commands.json --max-commands 512
 
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           set PATH=%CD%\%BUILD_DIR%;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%PATH%
           cmake --build %BUILD_DIR% -j %NUMBER_OF_PROCESSORS%
 
       - name: Build and run CPU-only format tests
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           cmake --build %BUILD_DIR% --target lichtfeld_format_tests -j %NUMBER_OF_PROCESSORS%
           ctest --test-dir %BUILD_DIR% --output-on-failure -R "^lichtfeld_format_tests$"
 
       - name: Build and run CPU-only Unicode path tests
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           cmake --build %BUILD_DIR% --target unicode_path_test -j %NUMBER_OF_PROCESSORS%
           %BUILD_DIR%\tests\unicode_path_test.exe --gtest_color=no
 
@@ -193,7 +258,7 @@ jobs:
         env:
           VCPKG_RUNTIME_SUBDIR: ${{ matrix.build_type == 'Debug' && 'debug\bin' || 'bin' }}
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           set PATH=%CD%\%BUILD_DIR%;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\%VCPKG_RUNTIME_SUBDIR%;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\tools\python3;%CUDA_PATH%\bin;%PATH%
           cmake --build %BUILD_DIR% --target lichtfeld_visualizer_tests -j %NUMBER_OF_PROCESSORS%
           ctest --test-dir %BUILD_DIR% --output-on-failure -R "^lichtfeld_visualizer_tests$"
